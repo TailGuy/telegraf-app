@@ -23,4 +23,4 @@ EXPOSE 7090
 
 # Command to run the application using Uvicorn
 # Make sure the port here matches the EXPOSE directive and docker-compose port mapping
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7090"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7090", "--log-config", "logging.conf"]

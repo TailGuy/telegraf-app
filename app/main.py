@@ -4,409 +4,389 @@ import datetime
 import docker
 import io
 import tarfile
-from fastapi import FastAPI, HTTPException, Depends, Header, status, Request, UploadFile, File
+import logging
+import aiofiles
+import re
+from urllib.parse import quote
+
+from fastapi import FastAPI, HTTPException, Depends, status, Request, UploadFile, File, Form
 from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from typing import Optional
-import logging
+from pydantic_settings import BaseSettings
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- Configuration & Logging Setup ---
 
-# Initialize the FastAPI app
+SHARED_CONFIG_PATH = "/app/shared_config/telegraf.conf"
+
+# DO NOT use logging.basicConfig() here. Uvicorn will manage the root logger.
+# We just get a specific logger for our application.
+logger = logging.getLogger("telegraf_manager")
+# You can set the level here if you want to override Uvicorn's default
+# logger.setLevel(logging.INFO) 
+
+class Settings(BaseSettings):
+    telegraf_container_name: str = "telegraf"
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+settings = Settings()
+
+# --- Application and Client Initialization ---
+
 app = FastAPI(
     title="Telegraf Manager API",
-    description="API for managing Telegraf container",
-    version="1.0.0"
+    description="API for managing a Telegraf container.",
+    version="1.4.1" # Version bump for interval change fix
 )
 
-# Set up templates
+# --- Logging Middleware ---
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Logs every incoming request."""
+    client_host = request.client.host
+    logger.info(f"Request: {request.method} {request.url.path} from {client_host}")
+    response = await call_next(request)
+    logger.info(f"Response: {response.status_code} for {request.method} {request.url.path}")
+    return response
+# --- End of Middleware ---
+
 templates = Jinja2Templates(directory="templates")
 
-# Start time of the application for uptime calculation
+try:
+    docker_client = docker.from_env()
+    docker_client.ping()
+    logger.info("Successfully connected to Docker daemon.")
+except docker.errors.DockerException as e:
+    logger.critical(f"Could not connect to Docker daemon. Error: {e}")
+    exit(1)
+
 START_TIME = time.time()
 
-# Initialize Docker client
-docker_client = docker.from_env()
+# --- Dependencies for Endpoints ---
 
-# Container name
-TELEGRAF_CONTAINER_NAME = "telegraf"
-
-# Helper function to get the Telegraf container
-def get_telegraf_container():
+def get_telegraf_container() -> docker.models.containers.Container:
+    """Dependency to get the Telegraf container object."""
+    logger.info(f"Attempting to get container '{settings.telegraf_container_name}'...")
     try:
-        container = docker_client.containers.get(TELEGRAF_CONTAINER_NAME)
+        container = docker_client.containers.get(settings.telegraf_container_name)
+        logger.info(f"Successfully retrieved container '{container.name}' (ID: {container.short_id}).")
         return container
     except docker.errors.NotFound:
+        logger.error(f"Container '{settings.telegraf_container_name}' not found.")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Telegraf container '{TELEGRAF_CONTAINER_NAME}' not found"
+            detail=f"Container '{settings.telegraf_container_name}' not found"
         )
-        
     except docker.errors.APIError as e:
+        logger.error(f"Docker API error while getting container: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Docker API error: {str(e)}"
         )
 
-# Simple API key authentication for the restart endpoint
-def verify_api_key(api_key: Optional[str] = Header(None, alias="X-API-Key")):
-    # Get the API key from environment variable or use a default for development
-    expected_api_key = os.environ.get("API_KEY")
-    
-    # If API_KEY is not set in environment, skip authentication
-    if not expected_api_key:
-        return True
-        
-    if api_key != expected_api_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key"
-        )
-    return True
+# --- Helper Functions ---
 
-# Health status endpoint - moved from root to /status
-@app.get("/status", tags=["Health"])
-async def health():
-    uptime_seconds = time.time() - START_TIME
-    uptime = str(datetime.timedelta(seconds=int(uptime_seconds)))
+def get_telegraf_status_details(container: docker.models.containers.Container) -> dict:
+    """A helper function to fetch, parse, and format the status of the Telegraf container."""
+    logger.info(f"Getting status details for container '{container.name}'...")
+    container.reload()
+    state = container.attrs["State"]
     
+    # ... (timestamp parsing logic remains the same) ...
+    try:
+        started_at_str = state["StartedAt"]
+        if 'Z' in started_at_str: started_at_str = started_at_str.replace('Z', '+00:00')
+        if '.' in started_at_str:
+            parts = started_at_str.split('.')
+            main_part = parts[0]
+            frac_and_tz = parts[1]
+            if '+' in frac_and_tz: frac_part, tz_part = frac_and_tz.split('+', 1); tz_part = '+' + tz_part
+            elif '-' in frac_and_tz: frac_part, tz_part = frac_and_tz.split('-', 1); tz_part = '-' + tz_part
+            else: frac_part, tz_part = frac_and_tz, ''
+            started_at_str = f"{main_part}.{frac_part[:6]}{tz_part}"
+        parsed_dt = datetime.datetime.fromisoformat(started_at_str)
+        started_at = parsed_dt.replace(tzinfo=datetime.timezone.utc) if parsed_dt.tzinfo is None else parsed_dt
+    except Exception as e:
+        logger.warning(f"Could not parse 'StartedAt' timestamp '{state.get('StartedAt', 'N/A')}'. Using fallback. Error: {e}")
+        started_at = datetime.datetime.now(datetime.timezone.utc)
+
+    logs_raw = container.logs(tail=10, timestamps=True).decode("utf-8", errors="ignore").strip()
+    # ... (log formatting logic remains the same) ...
+    formatted_logs = []
+    for line in logs_raw.split("\n"):
+        if line:
+            parts = line.split(" ", 1)
+            formatted_logs.append({"timestamp": parts[0], "message": parts[1]} if len(parts) == 2 else {"message": line})
+
+    health_check_data = state.get("Health")
+    # ... (health check logic remains the same) ...
+    health_check = None
+    if health_check_data:
+        health_check = {
+            "status": health_check_data.get("Status"),
+            "failing_streak": health_check_data.get("FailingStreak", 0),
+            "last_log": health_check_data.get("Log", [])[-1] if health_check_data.get("Log") else "No health log available"
+        }
+
+    logger.info(f"Finished getting status for '{container.name}'. Status: {state.get('Status')}")
     return {
-        "status": "healthy",
-        "uptime": uptime,
-        "uptime_seconds": uptime_seconds,
-        "started_at": datetime.datetime.fromtimestamp(START_TIME).isoformat()
+        "status": state.get("Status"),
+        "running": state.get("Running", False),
+        "started_at": started_at.isoformat(),
+        "uptime": str(datetime.datetime.now(datetime.timezone.utc) - started_at),
+        "health_check": health_check,
+        "recent_logs": formatted_logs
     }
 
-# Root endpoint - Simple web interface using templates
+async def change_agent_interval(new_interval: str):
+    """
+    Reads, modifies line-by-line, and writes the telegraf.conf with a new agent interval.
+    This approach is more robust than a single multi-line regex.
+    """
+    logger.info(f"Attempting to change agent interval to '{new_interval}' in '{SHARED_CONFIG_PATH}'.")
+
+    try:
+        async with aiofiles.open(SHARED_CONFIG_PATH, "r", encoding="utf-8") as f:
+            lines = await f.readlines()
+    except Exception as e:
+        logger.error(f"Failed to read config file for modification: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to read config file: {e}")
+
+    try:
+        # Find the line index for [agent]
+        agent_section_start_index = -1
+        for i, line in enumerate(lines):
+            if line.strip().lower() == '[agent]':
+                agent_section_start_index = i
+                break
+        
+        if agent_section_start_index == -1:
+            raise ValueError("Config is malformed: '[agent]' section not found.")
+
+        # Starting from just after '[agent]', find and replace the 'interval' line
+        found_and_replaced = False
+        interval_pattern = re.compile(r"^\s*interval\s*=\s*", re.IGNORECASE)
+        for i in range(agent_section_start_index + 1, len(lines)):
+            line = lines[i]
+            # If we hit another section, stop searching
+            if line.strip().startswith('['):
+                break
+            
+            if interval_pattern.match(line.strip()):
+                indentation = line[:len(line) - len(line.lstrip())]
+                lines[i] = f'{indentation}interval = "{new_interval}"\n'
+                found_and_replaced = True
+                logger.info(f"Found and replaced interval line. Old: '{line.strip()}', New: '{lines[i].strip()}'")
+                break # Essential: only replace the first one
+
+        if not found_and_replaced:
+            raise ValueError("Config is malformed: 'interval' key not found in '[agent]' section.")
+
+    except ValueError as e:
+        logger.error(str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Write the modified lines back to the file
+    try:
+        async with aiofiles.open(SHARED_CONFIG_PATH, "w", encoding="utf-8") as f:
+            await f.writelines(lines)
+        logger.info(f"Successfully updated agent interval to '{new_interval}'.")
+    except Exception as e:
+        logger.error(f"Failed to write updated config file: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to write updated config file: {e}")
+
+# --- API Endpoints ---
+
 @app.get("/", response_class=HTMLResponse, tags=["Web Interface"])
 async def root(request: Request):
-    # Get FastAPI status
+    """Serves the main web interface dashboard."""
+    logger.info("Rendering main dashboard.")
     uptime_seconds = time.time() - START_TIME
-    uptime = str(datetime.timedelta(seconds=int(uptime_seconds)))
-    
-    fastapi_status = {
+    app_status = {
         "status": "healthy",
-        "uptime": uptime,
+        "uptime": str(datetime.timedelta(seconds=int(uptime_seconds))),
         "started_at": datetime.datetime.fromtimestamp(START_TIME).isoformat()
     }
-    
-    # Get Telegraf status
     try:
         container = get_telegraf_container()
-        container_info = container.attrs
-        state = container_info["State"]
-        
-        # Get container logs (last 10 entries)
-        logs = container.logs(tail=10, timestamps=True).decode("utf-8").strip()
-        
-        # Format logs
-        formatted_logs = []
-        if logs:
-            log_lines = logs.split("\n")
-            for log in log_lines:
-                if log:
-                    # Try to split timestamp and message
-                    parts = log.split(" ", 1)
-                    if len(parts) == 2:
-                        timestamp, message = parts
-                        formatted_logs.append({"timestamp": timestamp, "message": message})
-                    else:
-                        formatted_logs.append({"message": log})
-        
-        # Get health check results if available
-        health_check = None
-        if "Health" in state:
-            health_check = {
-                "status": state["Health"]["Status"],
-                "failing_streak": state["Health"]["FailingStreak"],
-                "last_check": state["Health"]["Log"][-1] if state["Health"]["Log"] else None
-            }
-        
-        # Calculate last restart time
-        started_at_str = state["StartedAt"]
-        
-        # Handle timestamp format
-        try:
-            if started_at_str.endswith('Z'):
-                started_at_str = started_at_str.replace("Z", "+00:00")
-            
-            if '+' in started_at_str:
-                parts = started_at_str.split('+')
-                timestamp_part = parts[0]
-                timezone_part = '+' + parts[1]
-                
-                if '.' in timestamp_part:
-                    main_part, fractional_part = timestamp_part.split('.')
-                    fractional_part = fractional_part[:6]
-                    timestamp_part = f"{main_part}.{fractional_part}"
-                
-                started_at_str = timestamp_part + timezone_part
-            
-            started_at = datetime.datetime.fromisoformat(started_at_str)
-        except ValueError:
-            started_at = datetime.datetime.now(datetime.timezone.utc)
-        
-        telegraf_status = {
-            "status": state["Status"],
-            "running": state["Running"],
-            "health_check": health_check,
-            "uptime": str(datetime.datetime.now(datetime.timezone.utc) - started_at),
-            "started_at": started_at.isoformat(),
-            "last_restart": started_at.isoformat(),
-            "recent_logs": formatted_logs
-        }
+        telegraf_status = get_telegraf_status_details(container)
+    except HTTPException as e:
+        telegraf_status = {"status": "error", "error": e.detail}
     except Exception as e:
-        # If there's an error getting Telegraf status, provide error info
-        telegraf_status = {
-            "status": "error",
-            "running": False,
-            "error": str(e)
-        }
-    
-    # Render the template with the data
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "fastapi_status": fastapi_status,
-            "telegraf_status": telegraf_status
-        }
-    )
+        logger.error(f"Unexpected error on root path while getting container status: {e}", exc_info=True)
+        telegraf_status = {"status": "error", "error": "An unexpected server error occurred."}
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "fastapi_status": app_status,
+        "telegraf_status": telegraf_status,
+        "container_name": settings.telegraf_container_name
+    })
 
-# Telegraf status endpoint
-@app.get("/telegraf/status", tags=["Telegraf"])
-async def telegraf_status():
-    try:
-        container = get_telegraf_container()
-        
-        # Get container info
-        container_info = container.attrs
-        
-        # Get container state
-        state = container_info["State"]
-        
-        # Get container logs (last 10 entries)
-        logs = container.logs(tail=10, timestamps=True).decode("utf-8").strip()
-        
-        # Format logs
-        formatted_logs = []
-        if logs:
-            log_lines = logs.split("\n")
-            for log in log_lines:
-                if log:
-                    # Try to split timestamp and message
-                    parts = log.split(" ", 1)
-                    if len(parts) == 2:
-                        timestamp, message = parts
-                        formatted_logs.append({"timestamp": timestamp, "message": message})
-                    else:
-                        formatted_logs.append({"message": log})
-        
-        # Get health check results if available
-        health_check = None
-        if "Health" in state:
-            health_check = {
-                "status": state["Health"]["Status"],
-                "failing_streak": state["Health"]["FailingStreak"],
-                "last_check": state["Health"]["Log"][-1] if state["Health"]["Log"] else None
-            }
-        
-        # Calculate last restart time
-        started_at_str = state["StartedAt"]
-        
-        # Handle different timestamp formats
-        try:
-            # Try to parse with fromisoformat after cleaning up the format
-            if started_at_str.endswith('Z'):
-                started_at_str = started_at_str.replace("Z", "+00:00")
-            
-            # Remove nanoseconds if present (Python's fromisoformat doesn't handle them well)
-            if '+' in started_at_str:
-                parts = started_at_str.split('+')
-                timestamp_part = parts[0]
-                timezone_part = '+' + parts[1]
-                
-                # Truncate to microseconds (6 digits after the decimal)
-                if '.' in timestamp_part:
-                    main_part, fractional_part = timestamp_part.split('.')
-                    fractional_part = fractional_part[:6]  # Keep only up to 6 digits
-                    timestamp_part = f"{main_part}.{fractional_part}"
-                
-                started_at_str = timestamp_part + timezone_part
-            
-            started_at = datetime.datetime.fromisoformat(started_at_str)
-        except ValueError:
-            # Fallback to a more flexible parser
-            started_at = datetime.datetime.now(datetime.timezone.utc)
-        
-        return {
-            "status": state["Status"],
-            "running": state["Running"],
-            "health_check": health_check,
-            "uptime": str(datetime.datetime.now(datetime.timezone.utc) - started_at),
-            "started_at": started_at.isoformat(),
-            "last_restart": started_at.isoformat(),
-            "recent_logs": formatted_logs
-        }
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error getting Telegraf status: {str(e)}"
-        )
-
-# Telegraf config endpoint
-@app.get("/telegraf/config", tags=["Telegraf"], response_class=PlainTextResponse)
+@app.get("/telegraf/config", response_class=PlainTextResponse, tags=["Telegraf"])
 async def telegraf_config():
+    """Retrieves the current 'telegraf.conf' from the shared volume."""
+    logger.info(f"Reading config from shared path '{SHARED_CONFIG_PATH}'.")
     try:
-        # Get the Telegraf container
-        container = get_telegraf_container()
-        
-        # Execute command to read the config file
-        exec_result = container.exec_run("cat /etc/telegraf/telegraf.conf")
-        
-        if exec_result.exit_code != 0:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to read Telegraf config: {exec_result.output.decode('utf-8')}"
-            )
-        
-        return exec_result.output.decode("utf-8")
+        async with aiofiles.open(SHARED_CONFIG_PATH, "r") as f:
+            content = await f.read()
+        return content
+    except FileNotFoundError:
+        logger.error(f"Config file not found at '{SHARED_CONFIG_PATH}'.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Telegraf config file not found."
+        )
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
+        logger.error(f"Failed to read config file: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error reading Telegraf config: {str(e)}"
+            detail=f"Failed to read Telegraf config: {e}"
         )
 
-# Telegraf upload config endpoint
+@app.post("/telegraf/set-interval", tags=["Telegraf"])
+async def set_telegraf_interval(
+    request: Request,
+    interval: str = Form(...),
+    container: docker.models.containers.Container = Depends(get_telegraf_container)
+):
+    """
+    Sets the agent interval in the telegraf.conf file and restarts the container.
+    """
+    logger.info(f"Received request to set agent interval to '{interval}'.")
+
+    # 1. Validate the input format (e.g., "10s", "1m", "2h")
+    if not re.match(r"^\d+[smh]$", interval):
+        error_message = f"Invalid interval format: '{interval}'. Must be a number followed by 's', 'm', or 'h'."
+        logger.warning(error_message)
+        # URL-encode the error message to handle special characters
+        safe_error_message = quote(error_message)
+        return RedirectResponse(url=f"/?error={safe_error_message}", status_code=status.HTTP_303_SEE_OTHER)
+
+    # 2. Modify the configuration file
+    try:
+        await change_agent_interval(interval)
+    except HTTPException as e:
+        # If the file modification fails, redirect with that error
+        safe_error_message = quote(e.detail)
+        return RedirectResponse(url=f"/?error={safe_error_message}", status_code=status.HTTP_303_SEE_OTHER)
+
+    # 3. Restart the container to apply the changes
+    try:
+        logger.info("Restarting Telegraf container to apply new interval...")
+        container.restart(timeout=10)
+        logger.info("Telegraf container restarted successfully.")
+    except docker.errors.APIError as e:
+        logger.error(f"Interval updated, but failed to restart container: {e}", exc_info=True)
+        safe_error_message = quote(f"Interval updated, but container restart failed: {e}")
+        return RedirectResponse(url=f"/?error={safe_error_message}", status_code=status.HTTP_303_SEE_OTHER)
+
+    return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
 @app.post("/telegraf/upload-config", tags=["Telegraf"])
-async def upload_telegraf_config(request: Request, file: UploadFile = File(...), _: bool = Depends(verify_api_key)):
-    try:
-        container = get_telegraf_container()
-        content = await file.read()
-        
-        if not content:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty configuration file")
-        
-        logger.info(f"Received configuration file: {file.filename}, size: {len(content)} bytes")
-        
-        # Create temporary file
-        temp_file_path = "/tmp/telegraf.conf"
-        with open(temp_file_path, "wb") as temp_file:
-            temp_file.write(content)
-        
-        if not os.path.exists(temp_file_path):
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create temporary file")
-        
-        # Create tar archive and copy to container
-        tar_stream = io.BytesIO()
-        with tarfile.open(fileobj=tar_stream, mode='w') as tar:
-            tar.add(temp_file_path, arcname="telegraf.conf.new")
-        
-        tar_stream.seek(0)
-        put_result = container.put_archive("/tmp", tar_stream.read())
-        
-        if not put_result:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to copy configuration to container")
-        
-        # Move file to final location
-        exec_result = container.exec_run("sh -c 'cat /tmp/telegraf.conf.new > /etc/telegraf/telegraf.conf'")
-        
-        if exec_result.exit_code != 0:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-                               detail=f"Failed to update configuration file: {exec_result.output.decode('utf-8')}")
-        
-        # Restart container
-        try:
-            container.restart(timeout=10)
-        except Exception as restart_error:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                               detail=f"Failed to restart Telegraf container: {str(restart_error)}")
-        
-        # Cleanup
-        os.remove(temp_file_path)
-        
-        # Return appropriate response
-        if request and request.headers.get("content-type", "").startswith("multipart/form-data"):
-            return RedirectResponse(url="/", status_code=303)
-        else:
-            return {"success": True, "message": "Telegraf configuration updated successfully"}
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error updating Telegraf configuration: {str(e)}"
-        )
+async def upload_telegraf_config(
+    request: Request,
+    file: UploadFile = File(...),
+    container: docker.models.containers.Container = Depends(get_telegraf_container)
+):
+    """
+    Uploads a new 'telegraf.conf' and automatically restarts or starts the container.
+    """
+    logger.info(f"Received upload request for new configuration: '{file.filename}'.")
+    content = await file.read()
+    if not content:
+        logger.warning("Upload failed: file is empty.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
 
-# Telegraf restart endpoint - with redirect to homepage
-@app.post("/telegraf/restart", tags=["Telegraf"])
-async def restart_telegraf(request: Request = None, graceful: bool = True, _: bool = Depends(verify_api_key)):
+    # 1. Write the new config file to the shared volume
     try:
-        # Get the Telegraf container
-        container = get_telegraf_container()
-        
-        # Check if container is running before restart
-        container_info = container.attrs
-        was_running = container_info["State"]["Running"]
-        
-        # Pre-restart validation
-        if not was_running:
-            return {
-                "success": False,
-                "message": "Telegraf container is not running, cannot restart",
-                "status": "not_running"
-            }
-        
-        # Get the start time before restart
-        start_time_before = container_info["State"]["StartedAt"]
-        
-        # Restart the container
-        container.restart(timeout=10 if graceful else 0)
-        
-        # Wait a moment for the container to restart
-        time.sleep(2)
-        
-        # Get updated container info
-        container = get_telegraf_container()
-        container_info = container.attrs
-        
-        # Check if restart was successful
-        is_running = container_info["State"]["Running"]
-        start_time_after = container_info["State"]["StartedAt"]
-        
-        # Verify that the start time has changed
-        restart_successful = is_running and start_time_before != start_time_after
-        
-        # Check if this is a form submission from the web interface
-        if request and request.headers.get("content-type") == "application/x-www-form-urlencoded":
-            # Redirect back to the homepage
-            return RedirectResponse(url="/", status_code=303)
-        else:
-            # Return JSON response for API calls
-            if restart_successful:
-                return {
-                    "success": True,
-                    "message": f"Telegraf container restarted {'gracefully' if graceful else 'forcefully'}",
-                    "status": "running",
-                    "started_at": start_time_after
-                }
-            else:
-                return {
-                    "success": False,
-                    "message": "Telegraf container restart failed",
-                    "status": "failed",
-                    "is_running": is_running
-                }
+        async with aiofiles.open(SHARED_CONFIG_PATH, "wb") as f:
+            await f.write(content)
+        logger.info(f"Successfully wrote new configuration to '{SHARED_CONFIG_PATH}'.")
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error restarting Telegraf container: {str(e)}"
-        )
+        logger.error(f"Failed to write configuration to '{SHARED_CONFIG_PATH}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to write configuration file.")
+    
+    # 2. Apply the change by starting or restarting the container
+    try:
+        container.reload() # Get the latest status
+        if container.status == 'running':
+            logger.info("Container is running. Restarting to apply new config...")
+            container.restart()
+        else:
+            logger.info(f"Container is '{container.status}'. Starting with new config...")
+            container.start()
+        logger.info("Successfully applied new configuration to Telegraf container.")
+    except docker.errors.APIError as e:
+        logger.error(f"Config uploaded, but failed to start/restart container: {e}", exc_info=True)
+        # Let the user know the config was written but the apply step failed
+        raise HTTPException(status_code=500, detail=f"Config uploaded, but container action failed: {e}")
+        
+    return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
+@app.post("/telegraf/restart", tags=["Telegraf"])
+async def restart_telegraf(
+    request: Request,
+    container: docker.models.containers.Container = Depends(get_telegraf_container)
+):
+    """Restarts the Telegraf container."""
+    logger.info(f"Received restart request for container '{container.name}'.")
+    container.reload()
+    if not container.attrs["State"]["Running"]:
+        logger.warning(f"Cannot restart container '{container.name}': not running.")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Container is not running, cannot restart.")
+
+    start_time_before = container.attrs["State"]["StartedAt"]
+    logger.info(f"Restarting container '{container.name}' (was started at {start_time_before}).")
+    container.restart(timeout=10)
+    
+    # Wait a moment for the container state to update
+    time.sleep(2)
+    container.reload()
+    start_time_after = container.attrs["State"]["StartedAt"]
+    
+    if container.status == "restarting" or start_time_before == start_time_after:
+        logger.error(f"Restart command issued for '{container.name}', but failed to confirm restart. New start time: {start_time_after}")
+        raise HTTPException(status_code=500, detail="Container restart command issued, but it failed to restart.")
+    
+    logger.info(f"Container '{container.name}' restarted successfully. New start time: {start_time_after}.")
+    
+    if "application/x-www-form-urlencoded" in request.headers.get("content-type", ""):
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+    return {"success": True, "message": "Telegraf container restarted successfully."}
+
+@app.post("/telegraf/stop", tags=["Telegraf"])
+async def stop_telegraf(
+    request: Request,
+    container: docker.models.containers.Container = Depends(get_telegraf_container)
+):
+    """Stops the Telegraf container, breaking any restart loops."""
+    logger.info(f"Received stop request for container '{container.name}'.")
+    try:
+        container.stop(timeout=10)
+        logger.info(f"Container '{container.name}' stopped successfully.")
+    except Exception as e:
+        logger.error(f"Failed to stop container '{container.name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to stop container: {e}")
+
+    if "application/x-www-form-urlencoded" in request.headers.get("content-type", ""):
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+    return {"success": True, "message": "Telegraf container stopped."}
+
+@app.post("/telegraf/start", tags=["Telegraf"])
+async def start_telegraf(
+    request: Request,
+    container: docker.models.containers.Container = Depends(get_telegraf_container)
+):
+    """Starts the Telegraf container."""
+    logger.info(f"Received start request for container '{container.name}'.")
+    try:
+        container.start()
+        logger.info(f"Container '{container.name}' started successfully.")
+    except Exception as e:
+        logger.error(f"Failed to start container '{container.name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to start container: {e}")
+
+    if "application/x-www-form-urlencoded" in request.headers.get("content-type", ""):
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+    return {"success": True, "message": "Telegraf container started."}
