@@ -676,7 +676,7 @@ async def upload_csv_for_config(
     influxdb_url: str = Form("http://influxdb:8086"),
     container: docker.models.containers.Container = Depends(get_telegraf_container)
 ):
-    logger.info(f"Received CSV upload for config generation: {file.filename}"")
+    logger.info(f"Received CSV upload for config generation: {file.filename}")
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
@@ -702,7 +702,7 @@ async def upload_csv_for_config(
         if container.status == 'running':
             container.restart(timeout=30)
         else:
-        container.start()
+            container.start()
     except Exception as e:
         safe_error = quote(f"Config generated, but apply failed: {e}")
         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
