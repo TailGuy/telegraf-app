@@ -247,6 +247,18 @@
         </div>
     </div>
 
+    <div>
+        <h3>Generate Config from CSV</h3>
+        <form action="/telegraf/upload-csv" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" accept=".csv">
+            <input type="text" name="mqtt_broker" value="tcp://mosquitto:1883" placeholder="MQTT Broker">
+            <input type="text" name="opcua_endpoint" value="opc.tcp://100.94.111.58:4841" placeholder="OPC UA Endpoint">
+            <input type="text" name="influxdb_url" value="http://influxdb:8086" placeholder="InfluxDB URL">
+            <button type="submit">Upload CSV & Generate</button>
+        </form>
+        <p>Note: Generates telegraf.conf from CSV, applies it, and restarts Telegraf.</p>
+    </div>
+
     <script>
         document.addEventListener('DOMContentLoaded', function() {
             const dropArea = document.getElementById('drop-area');

@@ -4,6 +4,9 @@ FROM python:3.10-slim
 # Set the working directory
 WORKDIR /app
 
+# Upgrade system packages to reduce vulnerabilities
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
 # Install system dependencies if needed (e.g., for certain libraries)
 # RUN apt-get update && apt-get install -y --no-install-recommends some-package && rm -rf /var/lib/apt/lists/*
 
