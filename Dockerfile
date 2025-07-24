@@ -15,8 +15,7 @@ COPY requirements.txt requirements.txt
 
 # Install Python dependencies
 # Make sure 'docker' is listed in your requirements.txt
-RUN pip install --no-cache-dir --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
 COPY ./app /app
