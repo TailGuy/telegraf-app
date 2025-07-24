@@ -667,44 +667,45 @@ async def start_telegraf(
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
     return {"success": True, "message": "Telegraf container started."}
 
-@app.post("/telegraf/upload-csv", tags=["Telegraf"])
-async def upload_csv_for_config(
-    request: Request,
-    file: UploadFile = File(...),
-    mqtt_broker: str = Form("tcp://mosquitto:1883"),  # Default or from .env
-    opcua_endpoint: str = Form("opc.tcp://100.94.111.58:4841"),
-    influxdb_url: str = Form("http://influxdb:8086"),
-    container: docker.models.containers.Container = Depends(get_telegraf_container)
-):
-    logger.info(f"Received CSV upload for config generation: {file.filename}")
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty file")
+# TODO fix this later
+# @app.post("/telegraf/upload-csv", tags=["Telegraf"])
+# async def upload_csv_for_config(
+#     request: Request,
+#     file: UploadFile = File(...),
+#     mqtt_broker: str = Form("tcp://mosquitto:1883"),  # Default or from .env
+#     opcua_endpoint: str = Form("opc.tcp://100.94.111.58:4841"),
+#     influxdb_url: str = Form("http://influxdb:8086"),
+#     container: docker.models.containers.Container = Depends(get_telegraf_container)
+# ):
+#     logger.info(f"Received CSV upload for config generation: {file.filename}")
+#     content = await file.read()
+#     if not content:
+#         raise HTTPException(status_code=400, detail="Empty file")
 
-    try:
-        generator = TelegrafConfigGenerator(
-            csv_content=content,
-            output_file_path=SHARED_CONFIG_PATH,
-            mqtt_broker=mqtt_broker,
-            opcua_endpoint=opcua_endpoint,
-            influxdb_url=influxdb_url
-        )
-        new_config = generator.generate_config()
-        async with aiofiles.open(SHARED_CONFIG_PATH, "w") as f:
-            await f.write(new_config)
-    except Exception as e:
-        logger.error(f"Config generation: {e}", exc_info=True)
-        safe_error = quote(str(e))
-        return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
+#     try:
+#         generator = TelegrafConfigGenerator(
+#             csv_content=content,
+#             output_file_path=SHARED_CONFIG_PATH,
+#             mqtt_broker=mqtt_broker,
+#             opcua_endpoint=opcua_endpoint,
+#             influxdb_url=influxdb_url
+#         )
+#         new_config = generator.generate_config()
+#         async with aiofiles.open(SHARED_CONFIG_PATH, "w") as f:
+#             await f.write(new_config)
+#     except Exception as e:
+#         logger.error(f"Config generation: {e}", exc_info=True)
+#         safe_error = quote(str(e))
+#         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
 
-    try:
-        container.reload()
-        if container.status == 'running':
-            container.restart(timeout=30)
-        else:
-            container.start()
-    except Exception as e:
-        safe_error = quote(f"Config generated, but apply failed: {e}")
-        return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
+#     try:
+#         container.reload()
+#         if container.status == 'running':
+#             container.restart(timeout=30)
+#         else:
+#             container.start()
+#     except Exception as e:
+#         safe_error = quote(f"Config generated, but apply failed: {e}")
+#         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
 
-    return RedirectResponse(url="/", status_code=303)
+#     return RedirectResponse(url="/", status_code=303)
