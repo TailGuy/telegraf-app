@@ -4,3 +4,6 @@ docker
 python-multipart
 jinja2
 asyncua
+pydantic
+pydantic-settings
+aiofiles
