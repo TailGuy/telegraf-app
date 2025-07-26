@@ -8,7 +8,7 @@ import aiofiles
 import re
 from urllib.parse import quote
 import csv
-
+import tempfile
 from fastapi import FastAPI, HTTPException, Depends, status, Request, UploadFile, File, Form
 from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -668,44 +668,53 @@ async def start_telegraf(
     return {"success": True, "message": "Telegraf container started."}
 
 # TODO fix this later
-# @app.post("/telegraf/upload-csv", tags=["Telegraf"])
-# async def upload_csv_for_config(
-#     request: Request,
-#     file: UploadFile = File(...),
-#     mqtt_broker: str = Form("tcp://mosquitto:1883"),  # Default or from .env
-#     opcua_endpoint: str = Form("opc.tcp://100.94.111.58:4841"),
-#     influxdb_url: str = Form("http://influxdb:8086"),
-#     container: docker.models.containers.Container = Depends(get_telegraf_container)
-# ):
-#     logger.info(f"Received CSV upload for config generation: {file.filename}")
-#     content = await file.read()
-#     if not content:
-#         raise HTTPException(status_code=400, detail="Empty file")
+@app.post("/telegraf/upload-csv", tags=["Telegraf"])
+async def upload_csv_for_config(
+    request: Request,
+    file: UploadFile = File(...),
+    mqtt_broker: str = Form("tcp://mosquitto:1883"),
+    opcua_endpoint: str = Form("opc.tcp://100.94.111.58:4841"),
+    influxdb_url: str = Form("http://influxdb:8086"),
+    container: docker.models.containers.Container = Depends(get_telegraf_container)
+):
+    logger.info(f"Received CSV upload for config generation: {file.filename}")
+    content = await file.read()
+    if not content:
+        safe_error = quote("Empty file")
+        return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
 
-#     try:
-#         generator = TelegrafConfigGenerator(
-#             csv_content=content,
-#             output_file_path=SHARED_CONFIG_PATH,
-#             mqtt_broker=mqtt_broker,
-#             opcua_endpoint=opcua_endpoint,
-#             influxdb_url=influxdb_url
-#         )
-#         new_config = generator.generate_config()
-#         async with aiofiles.open(SHARED_CONFIG_PATH, "w") as f:
-#             await f.write(new_config)
-#     except Exception as e:
-#         logger.error(f"Config generation: {e}", exc_info=True)
-#         safe_error = quote(str(e))
-#         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
+    try:
+        # Save uploaded content to a temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_csv:
+            temp_csv.write(content)
+            csv_path = temp_csv.name
 
-#     try:
-#         container.reload()
-#         if container.status == 'running':
-#             container.restart(timeout=30)
-#         else:
-#             container.start()
-#     except Exception as e:
-#         safe_error = quote(f"Config generated, but apply failed: {e}")
-#         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
+        generator = TelegrafConfigGenerator(
+            csv_file_path=csv_path,
+            output_file_path=SHARED_CONFIG_PATH,
+            mqtt_broker=mqtt_broker,
+            opcua_endpoint=opcua_endpoint,
+            influxdb_url=influxdb_url
+        )
+        generator.run()  # Generates and writes the config to SHARED_CONFIG_PATH
 
-#     return RedirectResponse(url="/", status_code=303)
+        # Clean up temp file
+        os.unlink(csv_path)
+    except Exception as e:
+        logger.error(f"Config generation: {e}", exc_info=True)
+        if os.path.exists(csv_path):
+            os.unlink(csv_path)
+        safe_error = quote(str(e))
+        return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
+
+    try:
+        container.reload()
+        if container.status == 'running':
+            container.restart(timeout=30)
+        else:
+            container.start()
+    except Exception as e:
+        safe_error = quote(f"Config generated, but apply failed: {e}")
+        return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
+
+    return RedirectResponse(url="/", status_code=303)
