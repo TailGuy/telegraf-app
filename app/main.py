@@ -15,8 +15,9 @@ from fastapi.templating import Jinja2Templates
 from pydantic_settings import BaseSettings
 
 # --- Configuration & Logging Setup ---
-
+SHARED_PATH = "/app/shared_config"
 SHARED_CONFIG_PATH = "/app/shared_config/telegraf.conf"
+SHARED_NODES_PATH = "/app/shared_config/nodes.csv"
 
 # DO NOT use logging.basicConfig() here. Uvicorn will manage the root logger.
 # We just get a specific logger for our application.
@@ -210,6 +211,16 @@ async def change_agent_interval(new_interval: str):
         logger.error(f"Failed to write updated config file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to write updated config file: {e}")
 
+def check_csv_exists() -> bool:
+    """
+    Checks if the shared nodes CSV file exists.
+    """
+    try:
+        file_exists = os.path.exists(SHARED_NODES_PATH)
+    except Exception as e:
+        logger.error(f"Error checking if CSV file exists: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error checking CSV file existence: {e}")
+    return file_exists
 
 # --- Telegraf configuration generator class ---
 
@@ -487,16 +498,18 @@ async def root(request: Request):
     try:
         container = get_telegraf_container()
         telegraf_status = get_telegraf_status_details(container)
+        file_exists = check_csv_exists()
     except HTTPException as e:
         telegraf_status = {"status": "error", "error": e.detail}
     except Exception as e:
-        logger.error(f"Unexpected error on root path while getting container status: {e}", exc_info=True)
+        logger.error(f"Unexpected error on root path while getting container status or nodes csv file check: {e}", exc_info=True)
         telegraf_status = {"status": "error", "error": "An unexpected server error occurred."}
     return templates.TemplateResponse("index.html", {
         "request": request,
         "fastapi_status": app_status,
         "telegraf_status": telegraf_status,
-        "container_name": settings.telegraf_container_name
+        "container_name": settings.telegraf_container_name,
+        "file_exists": file_exists
     })
 
 @app.get("/telegraf/config", response_class=PlainTextResponse, tags=["Telegraf"])
@@ -679,18 +692,39 @@ async def upload_csv_for_config(
 ):
     logger.info(f"Received CSV upload for config generation: {file.filename}")
     content = await file.read()
+
     if not content:
         safe_error = quote("Empty file")
         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
 
     try:
-        # Save uploaded content to a temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_csv:
-            temp_csv.write(content)
-            csv_path = temp_csv.name
+        # # Save uploaded content to a temp file
+        # with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_csv:
+        #     temp_csv.write(content)
+        #     csv_path = temp_csv.name
+
+        nodes_csv_backed_up = False
+        try:
+            logger.info(f"Writing uploaded CSV content to {SHARED_NODES_PATH}.")
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            try:
+                if check_csv_exists():
+                    os.rename(SHARED_NODES_PATH, SHARED_PATH + f"/nodes_backup_{timestamp}.csv")
+                    nodes_csv_backed_up = True
+                else:
+                    logger.warning(f"{SHARED_NODES_PATH} does not exist, skipping backup.")
+            except:
+                logger.error(f"Failed to back up existing CSV file at {SHARED_NODES_PATH}.", exc_info=True)
+            with open(SHARED_NODES_PATH, 'wb') as nodes_csv:
+                nodes_csv.write(content)
+        except Exception as e:
+            if nodes_csv_backed_up:
+                os.rename(SHARED_PATH + f"/nodes_backup_{timestamp}.csv", SHARED_NODES_PATH)
+            logger.error(f"Failed to write uploaded CSV content to {SHARED_NODES_PATH}: {e}", exc_info=True)
+            return RedirectResponse(url="/?error=Failed to write uploaded CSV content", status_code=303)   
 
         generator = TelegrafConfigGenerator(
-            csv_file_path=csv_path,
+            csv_file_path=SHARED_NODES_PATH,
             output_file_path=SHARED_CONFIG_PATH,
             mqtt_broker=mqtt_broker,
             opcua_endpoint=opcua_endpoint,
@@ -698,8 +732,8 @@ async def upload_csv_for_config(
         )
         generator.run()  # Generates and writes the config to SHARED_CONFIG_PATH
 
-        # Clean up temp file
-        os.unlink(csv_path)
+        # # Clean up temp file
+        # os.unlink(csv_path)
     except Exception as e:
         logger.error(f"Config generation: {e}", exc_info=True)
         if os.path.exists(csv_path):
@@ -718,3 +752,13 @@ async def upload_csv_for_config(
         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
 
     return RedirectResponse(url="/", status_code=303)
+
+@app.get("/export_nodes_csv")
+async def export_nodes_csv():
+    logger.info("Exporting nodes CSV file.")
+    try:
+        return FileResponse(SHARED_NODES_PATH, filename="nodes.csv")
+    except:
+        logger.error(f"Failed to export nodes CSV file from {SHARED_NODES_PATH}.")
+        raise HTTPException(status_code=404, detail="Nodes CSV file not found.")
+
