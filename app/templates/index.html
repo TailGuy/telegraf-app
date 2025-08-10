@@ -2,7 +2,7 @@
 <html>
 <head>
     <title>Telegraf Manager</title>
-    <meta http-equiv="refresh" content="5">
+    <!-- <meta http-equiv="refresh" content="5"> -->
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -137,6 +137,22 @@
         .status-restarting {
             color: #ff9800; font-weight: bold;
         }
+        .generate-form {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .generate-form input[type="file"],
+        .generate-form input[type="text"] {
+            padding: 4px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            flex: 1 1 auto;
+        }
+        .generate-form button {
+            flex-shrink: 0;
+        }
     </style>
 </head>
 <body>
@@ -248,9 +264,9 @@
     </div>
 
     <!-- TODO fix this later -->
-    <!-- <div>
+    <div class="status-box config-section">
         <h3>Generate Config from CSV</h3>
-        <form action="/telegraf/upload-csv" method="post" enctype="multipart/form-data">
+        <form action="/telegraf/upload-csv" method="post" enctype="multipart/form-data" class="generate-form">
             <input type="file" name="file" accept=".csv">
             <input type="text" name="mqtt_broker" value="tcp://mosquitto:1883" placeholder="MQTT Broker">
             <input type="text" name="opcua_endpoint" value="opc.tcp://100.94.111.58:4841" placeholder="OPC UA Endpoint">
@@ -258,7 +274,27 @@
             <button type="submit">Upload CSV & Generate</button>
         </form>
         <p>Note: Generates telegraf.conf from CSV, applies it, and restarts Telegraf.</p>
-    </div> -->
+        <h3>Download last used CSV file</h3>
+        <a href="/export_nodes_csv" download>
+            <button>Download current csv file</button>
+        </a>
+        {% if file_exists %}
+            <p> (Nodes CSV file currently exists)</p>
+        {% else %}
+            <p> (No nodes CSV file exists)</p>
+        {% endif %}
+    </div>
+
+    {% if success_message %}
+    <script>
+        alert("{{ success_message }}");
+    </script>
+    {% endif %}
+    {% if error_message %}  <!-- Optional: For displaying errors -->
+    <script>
+        alert("Error: {{ error_message }}");
+    </script>
+    {% endif %}
 
     <script>
         document.addEventListener('DOMContentLoaded', function() {

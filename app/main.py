@@ -8,15 +8,17 @@ import aiofiles
 import re
 from urllib.parse import quote
 import csv
-
+import tempfile
 from fastapi import FastAPI, HTTPException, Depends, status, Request, UploadFile, File, Form
 from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.responses import FileResponse
 from pydantic_settings import BaseSettings
 
 # --- Configuration & Logging Setup ---
-
+SHARED_PATH = "/app/shared_config"
 SHARED_CONFIG_PATH = "/app/shared_config/telegraf.conf"
+SHARED_NODES_PATH = "/app/shared_config/nodes.csv"
 
 # DO NOT use logging.basicConfig() here. Uvicorn will manage the root logger.
 # We just get a specific logger for our application.
@@ -210,6 +212,16 @@ async def change_agent_interval(new_interval: str):
         logger.error(f"Failed to write updated config file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to write updated config file: {e}")
 
+def check_csv_exists() -> bool:
+    """
+    Checks if the shared nodes CSV file exists.
+    """
+    try:
+        file_exists = os.path.exists(SHARED_NODES_PATH)
+    except Exception as e:
+        logger.error(f"Error checking if CSV file exists: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error checking CSV file existence: {e}")
+    return file_exists
 
 # --- Telegraf configuration generator class ---
 
@@ -484,19 +496,29 @@ async def root(request: Request):
         "uptime": str(datetime.timedelta(seconds=int(uptime_seconds))),
         "started_at": datetime.datetime.fromtimestamp(START_TIME).isoformat()
     }
+    success_message = None
+    error_message = None
+    if request.query_params.get('success') == 'csv_uploaded':
+        success_message = "CSV file uploaded, configuration generated, and Telegraf applied successfully."
+    if request.query_params.get('error'):
+        error_message = request.query_params.get('error')
     try:
         container = get_telegraf_container()
         telegraf_status = get_telegraf_status_details(container)
+        file_exists = check_csv_exists()
     except HTTPException as e:
         telegraf_status = {"status": "error", "error": e.detail}
     except Exception as e:
-        logger.error(f"Unexpected error on root path while getting container status: {e}", exc_info=True)
+        logger.error(f"Unexpected error on root path while getting container status or nodes csv file check: {e}", exc_info=True)
         telegraf_status = {"status": "error", "error": "An unexpected server error occurred."}
     return templates.TemplateResponse("index.html", {
         "request": request,
         "fastapi_status": app_status,
         "telegraf_status": telegraf_status,
-        "container_name": settings.telegraf_container_name
+        "container_name": settings.telegraf_container_name,
+        "success_message": success_message,
+        "error_message": error_message,
+        "file_exists": file_exists
     })
 
 @app.get("/telegraf/config", response_class=PlainTextResponse, tags=["Telegraf"])
@@ -668,44 +690,87 @@ async def start_telegraf(
     return {"success": True, "message": "Telegraf container started."}
 
 # TODO fix this later
-# @app.post("/telegraf/upload-csv", tags=["Telegraf"])
-# async def upload_csv_for_config(
-#     request: Request,
-#     file: UploadFile = File(...),
-#     mqtt_broker: str = Form("tcp://mosquitto:1883"),  # Default or from .env
-#     opcua_endpoint: str = Form("opc.tcp://100.94.111.58:4841"),
-#     influxdb_url: str = Form("http://influxdb:8086"),
-#     container: docker.models.containers.Container = Depends(get_telegraf_container)
-# ):
-#     logger.info(f"Received CSV upload for config generation: {file.filename}")
-#     content = await file.read()
-#     if not content:
-#         raise HTTPException(status_code=400, detail="Empty file")
+@app.post("/telegraf/upload-csv", tags=["Telegraf"])
+async def upload_csv_for_config(
+    request: Request,
+    file: UploadFile = File(...),
+    mqtt_broker: str = Form("tcp://mosquitto:1883"),
+    opcua_endpoint: str = Form("opc.tcp://100.94.111.58:4841"),
+    influxdb_url: str = Form("http://influxdb:8086"),
+    container: docker.models.containers.Container = Depends(get_telegraf_container)
+):
+    logger.info(f"Received CSV upload for config generation: {file.filename}")
+    content = await file.read()
 
-#     try:
-#         generator = TelegrafConfigGenerator(
-#             csv_content=content,
-#             output_file_path=SHARED_CONFIG_PATH,
-#             mqtt_broker=mqtt_broker,
-#             opcua_endpoint=opcua_endpoint,
-#             influxdb_url=influxdb_url
-#         )
-#         new_config = generator.generate_config()
-#         async with aiofiles.open(SHARED_CONFIG_PATH, "w") as f:
-#             await f.write(new_config)
-#     except Exception as e:
-#         logger.error(f"Config generation: {e}", exc_info=True)
-#         safe_error = quote(str(e))
-#         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
+    if not content:
+        safe_error = quote("Empty file")
+        return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
 
-#     try:
-#         container.reload()
-#         if container.status == 'running':
-#             container.restart(timeout=30)
-#         else:
-#             container.start()
-#     except Exception as e:
-#         safe_error = quote(f"Config generated, but apply failed: {e}")
-#         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
+    try:
+        # # Save uploaded content to a temp file
+        # with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_csv:
+        #     temp_csv.write(content)
+        #     csv_path = temp_csv.name
 
-#     return RedirectResponse(url="/", status_code=303)
+        nodes_csv_backed_up = False
+        try:
+            logger.info(f"Writing uploaded CSV content to {SHARED_NODES_PATH}.")
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            try:
+                if check_csv_exists():
+                    os.rename(SHARED_NODES_PATH, SHARED_PATH + f"/nodes_backup_{timestamp}.csv")
+                    nodes_csv_backed_up = True
+                else:
+                    logger.warning(f"{SHARED_NODES_PATH} does not exist, skipping backup.")
+            except:
+                logger.error(f"Failed to back up existing CSV file at {SHARED_NODES_PATH}.", exc_info=True)
+            with open(SHARED_NODES_PATH, 'wb') as nodes_csv:
+                nodes_csv.write(content)
+        except Exception as e:
+            if nodes_csv_backed_up:
+                os.rename(SHARED_PATH + f"/nodes_backup_{timestamp}.csv", SHARED_NODES_PATH)
+            logger.error(f"Failed to write uploaded CSV content to {SHARED_NODES_PATH}: {e}", exc_info=True)
+            return RedirectResponse(url="/?error=Failed to write uploaded CSV content", status_code=303)   
+
+        generator = TelegrafConfigGenerator(
+            csv_file_path=SHARED_NODES_PATH,
+            output_file_path=SHARED_CONFIG_PATH,
+            mqtt_broker=mqtt_broker,
+            opcua_endpoint=opcua_endpoint,
+            influxdb_url=influxdb_url
+        )
+        generator.run()  # Generates and writes the config to SHARED_CONFIG_PATH
+
+        # # Clean up temp file
+        # os.unlink(csv_path)
+        
+
+    except Exception as e:
+        logger.error(f"Config generation: {e}", exc_info=True)
+        if os.path.exists(csv_path):
+            os.unlink(csv_path)
+        safe_error = quote(str(e))
+        return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
+
+    try:
+        container.reload()
+        if container.status == 'running':
+            container.restart(timeout=30)
+        else:
+            container.start()
+        
+    except Exception as e:
+        safe_error = quote(f"Config generated, but apply failed: {e}")
+        return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
+
+    # return RedirectResponse(url="/", status_code=303)
+    return RedirectResponse(url="/?success=csv_uploaded", status_code=303)
+
+@app.get("/export_nodes_csv")
+async def export_nodes_csv():
+    logger.info("Exporting nodes CSV file.")
+    try:
+        return FileResponse(SHARED_NODES_PATH, filename="nodes.csv")
+    except:
+        logger.error(f"Failed to export nodes CSV file from {SHARED_NODES_PATH}.")
+        raise HTTPException(status_code=404, detail="Nodes CSV file not found.")
