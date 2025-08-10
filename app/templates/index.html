@@ -285,6 +285,17 @@
         {% endif %}
     </div>
 
+    {% if success_message %}
+    <script>
+        alert("{{ success_message }}");
+    </script>
+    {% endif %}
+    {% if error_message %}  <!-- Optional: For displaying errors -->
+    <script>
+        alert("Error: {{ error_message }}");
+    </script>
+    {% endif %}
+
     <script>
         document.addEventListener('DOMContentLoaded', function() {
             const dropArea = document.getElementById('drop-area');

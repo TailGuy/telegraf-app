@@ -12,6 +12,7 @@ import tempfile
 from fastapi import FastAPI, HTTPException, Depends, status, Request, UploadFile, File, Form
 from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.responses import FileResponse
 from pydantic_settings import BaseSettings
 
 # --- Configuration & Logging Setup ---
@@ -495,6 +496,12 @@ async def root(request: Request):
         "uptime": str(datetime.timedelta(seconds=int(uptime_seconds))),
         "started_at": datetime.datetime.fromtimestamp(START_TIME).isoformat()
     }
+    success_message = None
+    error_message = None
+    if request.query_params.get('success') == 'csv_uploaded':
+        success_message = "CSV file uploaded, configuration generated, and Telegraf applied successfully."
+    if request.query_params.get('error'):
+        error_message = request.query_params.get('error')
     try:
         container = get_telegraf_container()
         telegraf_status = get_telegraf_status_details(container)
@@ -509,6 +516,8 @@ async def root(request: Request):
         "fastapi_status": app_status,
         "telegraf_status": telegraf_status,
         "container_name": settings.telegraf_container_name,
+        "success_message": success_message,
+        "error_message": error_message,
         "file_exists": file_exists
     })
 
@@ -734,6 +743,8 @@ async def upload_csv_for_config(
 
         # # Clean up temp file
         # os.unlink(csv_path)
+        
+
     except Exception as e:
         logger.error(f"Config generation: {e}", exc_info=True)
         if os.path.exists(csv_path):
@@ -747,11 +758,13 @@ async def upload_csv_for_config(
             container.restart(timeout=30)
         else:
             container.start()
+        
     except Exception as e:
         safe_error = quote(f"Config generated, but apply failed: {e}")
         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
 
-    return RedirectResponse(url="/", status_code=303)
+    # return RedirectResponse(url="/", status_code=303)
+    return RedirectResponse(url="/?success=csv_uploaded", status_code=303)
 
 @app.get("/export_nodes_csv")
 async def export_nodes_csv():
@@ -761,4 +774,3 @@ async def export_nodes_csv():
     except:
         logger.error(f"Failed to export nodes CSV file from {SHARED_NODES_PATH}.")
         raise HTTPException(status_code=404, detail="Nodes CSV file not found.")
-
