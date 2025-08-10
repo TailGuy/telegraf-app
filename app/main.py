@@ -774,3 +774,19 @@ async def export_nodes_csv():
     except:
         logger.error(f"Failed to export nodes CSV file from {SHARED_NODES_PATH}.")
         raise HTTPException(status_code=404, detail="Nodes CSV file not found.")
+
+@app.get("/csvdata", response_class=HTMLResponse, tags=["CSV"])
+async def get_csv_data(request: Request):
+    if not os.path.exists(SHARED_NODES_PATH):
+        raise HTTPException(status_code=404, detail="CSV file not found.")
+    
+    with open(SHARED_NODES_PATH, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        headers = next(reader, None)  # Get headers; None if empty
+        rows = list(reader)  # Get all data rows
+    
+    return templates.TemplateResponse("csv_table.html", {
+        "request": request,
+        "headers": headers or [],
+        "rows": rows
+    })
