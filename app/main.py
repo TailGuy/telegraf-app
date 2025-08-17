@@ -316,7 +316,7 @@ class TelegrafConfigGenerator:
                 reader = csv.DictReader(csvfile)
                 for row in reader:
                     # Ensure required columns exist
-                    if all(key in row for key in ['NodeId', 'CustomName']):
+                    if all(key in row for key in ['NodeId', 'MQTTCustomName']):
                         # Extract namespace and identifier from NodeId
                         node_id_parts = row['NodeId'].split(';')
                         if len(node_id_parts) != 2:
@@ -325,10 +325,10 @@ class TelegrafConfigGenerator:
                         
                         namespace = node_id_parts[0].replace('ns=', '')
                         identifier = node_id_parts[1].replace('s=', '')
-                        custom_name = row['CustomName']
+                        mqtt_custom_name = row['MQTTCustomName']
                         
-                        # Generate MQTT topic name using the CustomName and validate/sanitize it
-                        mqtt_topic = f"telegraf/opcua/{custom_name}"
+                        # Generate MQTT topic name using the MQTTCustomName and validate/sanitize it
+                        mqtt_topic = f"telegraf/opcua/{mqtt_custom_name}"
                         if not self.validate_mqtt_topic(mqtt_topic):
                             original_topic = mqtt_topic
                             mqtt_topic = self.sanitize_mqtt_topic(mqtt_topic)
@@ -338,7 +338,7 @@ class TelegrafConfigGenerator:
                         
                         nodes.append({
                             'node_id': row['NodeId'],
-                            'custom_name': custom_name,
+                            'mqtt_custom_name': mqtt_custom_name,
                             'namespace': namespace,
                             'identifier': identifier,
                             'identifier_type': 's',  # Assuming all are string type as per example
@@ -358,8 +358,11 @@ class TelegrafConfigGenerator:
         # Generate Telegraf configuration
         config = []
         
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         # Add agent section
-        config.append("""# Telegraf Configuration for OPC UA Monitoring
+        config.append(f"""# Generated at {timestamp}
+# Telegraf Configuration for OPC UA Monitoring
 # Generated from CSV file
 
 ###############################################################################
@@ -415,7 +418,7 @@ class TelegrafConfigGenerator:
         # Add node configurations
         for node in nodes:
             config.append(f"""  [[inputs.opcua.nodes]]
-    name = "{node['custom_name']}"
+    name = "{node['mqtt_custom_name']}"
     namespace = "{node['namespace']}"
     identifier_type = "{node['identifier_type']}"
     identifier = '''{node['identifier']}'''
@@ -449,7 +452,7 @@ class TelegrafConfigGenerator:
   qos = 0
   retain = false
   data_format = "template"
-  template = "{{{{ .Field \\"{node['custom_name']}\\" }}}}"
+  template = "{{{{ .Field \\"{node['mqtt_custom_name']}\\" }}}}"
 ''')
         
         # Write configuration to file
@@ -498,6 +501,23 @@ async def root(request: Request):
     }
     success_message = None
     error_message = None
+
+    # backups = [f for f in os.listdir(SHARED_PATH) if f.startswith("nodes_backup_") and f.endswith(".csv")]
+    # backups.sort(reverse=True) 
+
+    backups = []
+    for f in os.listdir(SHARED_PATH):
+        if f.startswith("nodes_backup_") and f.endswith(".csv"):
+            timestamp_str = f[13:-4]  # Slice from after "nodes_backup_" (13 chars) to before ".csv" (4 chars)
+            try:
+                dt = datetime.datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                formatted = dt.strftime("%Y-%m-%d %H:%M:%S")
+                backups.append({"filename": f, "date": formatted})
+            except ValueError:
+                logger.warning(f"Invalid timestamp in backup filename: {f}")
+                continue  # Skip files with malformed timestamps
+    backups.sort(key=lambda x: x["date"], reverse=True)  # Sort newest first by date string
+        
     if request.query_params.get('success') == 'csv_uploaded':
         success_message = "CSV file uploaded, configuration generated, and Telegraf applied successfully."
     if request.query_params.get('error'):
@@ -518,7 +538,8 @@ async def root(request: Request):
         "container_name": settings.telegraf_container_name,
         "success_message": success_message,
         "error_message": error_message,
-        "file_exists": file_exists
+        "file_exists": file_exists,
+        "backups": backups,
     })
 
 @app.get("/telegraf/config", response_class=PlainTextResponse, tags=["Telegraf"])
@@ -774,3 +795,31 @@ async def export_nodes_csv():
     except:
         logger.error(f"Failed to export nodes CSV file from {SHARED_NODES_PATH}.")
         raise HTTPException(status_code=404, detail="Nodes CSV file not found.")
+
+@app.get("/export_backup/{filename}")
+async def export_backup(filename: str):
+    if not filename.startswith("nodes_backup_") or not filename.endswith(".csv"):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    file_path = os.path.join(SHARED_PATH, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    logger.info(f"Exporting backup CSV file: {filename}")
+    return FileResponse(file_path, filename=filename)
+
+@app.get("/csvdata", response_class=HTMLResponse, tags=["CSV"])
+async def get_csv_data(request: Request):
+    if not os.path.exists(SHARED_NODES_PATH):
+        raise HTTPException(status_code=404, detail="CSV file not found.")
+    
+    with open(SHARED_NODES_PATH, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        headers = next(reader, None)  # Get headers; None if empty
+        rows = list(reader)  # Get all data rows
+    
+    return templates.TemplateResponse("csv_table.html", {
+        "request": request,
+        "headers": headers or [],
+        "rows": rows
+    })
