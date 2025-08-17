@@ -263,7 +263,7 @@
         </div>
     </div>
 
-    <!-- TODO fix this later -->
+    <!-- csv part -->
     <div class="status-box config-section">
         <h3>Generate Config from CSV</h3>
         <form action="/telegraf/upload-csv" method="post" enctype="multipart/form-data" class="generate-form">
@@ -286,6 +286,35 @@
         <a href="/csvdata">
             <button>View CSV Table</button>
         </a>
+        <!-- {% if backups %}
+            <h3>Historical Backups:</h3>
+            <ul>
+                {% for backup in backups %}
+                    <li><a href="/export_backup/{{ backup.filename }}" download>{{ backup.filename }} ({{ backup.date }})</a></li>
+                {% endfor %}
+            </ul>
+        {% endif %} -->
+        {% if backups %}
+            <h3>Historical Backups:</h3>
+            <table style="border-collapse: separate; border-spacing: 7px;">
+                <thead>
+                    <tr>
+                        <th>Action</th>
+                        <th>File</th>
+                        <th>Date</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for backup in backups %}
+                        <tr>
+                            <td><a href="/export_backup/{{ backup.filename }}" download><button>Download CSV</button></a></td>
+                            <td>{{ backup.filename }}</td>
+                            <td>{{ backup.date }}</td>
+                        </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        {% endif %}
     </div>
 
     {% if success_message %}
