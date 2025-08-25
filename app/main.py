@@ -346,7 +346,8 @@ class TelegrafConfigGenerator:
                         })
                         self._total_nodes_processed += 1
                     else:
-                        logger.warning(f"Row missing required columns: {row}")
+                        missing_columns = [key for key in ['NodeId', 'MQTTCustomName'] if key not in row or not row[key]]
+                        logger.warning(f"Row missing required columns {missing_columns}: {row}")
             
             logger.info(f"Successfully processed {self._total_nodes_processed} nodes from CSV.")
             logger.info(f"Sanitized {self._topics_sanitized} MQTT topics with restricted characters.")
