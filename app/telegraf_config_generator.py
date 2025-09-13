@@ -3,6 +3,7 @@ import time
 import datetime
 import logging
 import csv
+from tomlkit import document, table, aot, comment, nl, integer, boolean, string
 
 logger = logging.getLogger("telegraf_manager.telegraf_config_generator")
 
@@ -147,113 +148,117 @@ class TelegrafConfigGenerator:
             logger.error(f"Error reading CSV file: {e}", exc_info=True)
             return
         
-
-
-        # Generate Telegraf configuration
-        config = []
+        # Generate Telegraf configuration using tomlkit
+        doc = document()
         
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+        
+        # Add header comments
+        doc.add(comment(f"Generated at {timestamp}"))
+        doc.add(comment("Telegraf Configuration for OPC UA Monitoring"))
+        doc.add(comment("Generated from CSV file"))
+        doc.add(nl())
+        
         # Add agent section
-        config.append(f"""# Generated at {timestamp}
-# Telegraf Configuration for OPC UA Monitoring
-# Generated from CSV file
-
-###############################################################################
-#                            AGENT SETTINGS                                   #
-###############################################################################
-[agent]
-  interval = "10s"
-  round_interval = true
-  metric_batch_size = 1000
-  metric_buffer_limit = 10000
-  collection_jitter = "0s"
-  flush_interval = "10s"
-  flush_jitter = "0s"
-  precision = ""
-  hostname = ""
-  omit_hostname = true
-""")
+        doc.add(comment("###############################################################################"))
+        doc.add(comment("#                            AGENT SETTINGS                                   #"))
+        doc.add(comment("###############################################################################"))
         
-        # Add OPC UA input plugin
-        config.append(f"""
-###############################################################################
-#                            INPUT PLUGINS                                    #
-###############################################################################
-
-# Read data from an OPC UA server
-[[inputs.opcua]]
-  ## OPC UA Server Endpoint URL.
-  endpoint = "{self.opcua_endpoint}" # Replace with your OPC UA Server URL
-
-  ## Security policy: "None", "Basic128Rsa15", "Basic256", "Basic256Sha256".
-  security_policy = "None"
-  ## Security mode: "None", "Sign", "SignAndEncrypt".
-  security_mode = "None"
-
-  ## Path to certificate file (Required if SecurityMode != "None").
-  certificate = ""
-  ## Path to private key file (Required if SecurityMode != "None").
-  private_key = ""
-
-  ## Authentication method: "Anonymous", "UserName", "Certificate".
-  auth_method = "Anonymous"
-  # username = "" # Required if AuthMethod="UserName"
-  # password = "" # Required if AuthMethod="UserName"
-
-  ## Connection timeout for establishing the OPC UA connection.
-  connect_timeout = "10s"
-  ## Request timeout for individual OPC UA read requests.
-  request_timeout = "5s"
-
-  ## Node Configuration: Define the OPC UA nodes to read data from.
-""")
+        agent = table()
+        agent.add("interval", "10s")
+        agent.add("round_interval", boolean(True))
+        agent.add("metric_batch_size", integer(1000))
+        agent.add("metric_buffer_limit", integer(10000))
+        agent.add("collection_jitter", "0s")
+        agent.add("flush_interval", "10s")
+        agent.add("flush_jitter", "0s")
+        agent.add("precision", "")
+        agent.add("hostname", "")
+        agent.add("omit_hostname", boolean(True))
+        doc.add("agent", agent)
+        doc.add(nl())
         
-        # Add node configurations
+        # Add inputs section
+        doc.add(comment("###############################################################################"))
+        doc.add(comment("#                            INPUT PLUGINS                                    #"))
+        doc.add(comment("###############################################################################"))
+        doc.add(nl())
+        doc.add(comment("# Read data from an OPC UA server"))
+        
+        inputs = table()
+        opcua_aot = aot()
+        opcua = table()
+        opcua.add("endpoint", self.opcua_endpoint).comment("Replace with your OPC UA Server URL")
+        opcua.add("security_policy", "None").comment('"None", "Basic128Rsa15", "Basic256", "Basic256Sha256".')
+        opcua.add("security_mode", "None").comment('"None", "Sign", "SignAndEncrypt".')
+        opcua.add("certificate", "").comment('Path to certificate file (Required if SecurityMode != "None").')
+        opcua.add("private_key", "").comment('Path to private key file (Required if SecurityMode != "None").')
+        opcua.add("auth_method", "Anonymous").comment('"Anonymous", "UserName", "Certificate".')
+        opcua.add("connect_timeout", "10s").comment("Connection timeout for establishing the OPC UA connection.")
+        opcua.add("request_timeout", "5s").comment("Request timeout for individual OPC UA read requests.")
+        doc.add(nl())
+        opcua.add(comment("## Node Configuration: Define the OPC UA nodes to read data from."))
+        
+        nodes_aot = aot()
         for node in nodes:
-            config.append(f"""  [[inputs.opcua.nodes]]
-    name = "{node['mqtt_custom_name']}"
-    namespace = "{node['namespace']}"
-    identifier_type = "{node['identifier_type']}"
-    identifier = '''{node['identifier']}'''
-""")
+            node_table = table()
+            node_table.add("name", node["mqtt_custom_name"])
+            node_table.add("namespace", node["namespace"])
+            node_table.add("identifier_type", node["identifier_type"])
+            node_table.add("identifier", string(node["identifier"], multiline=True))
+            nodes_aot.append(node_table)
         
-        # Add InfluxDB output plugin
-        config.append(f"""              
-###############################################################################
-#                            OUTPUT PLUGINS                                   #
-###############################################################################
-
-# --- InfluxDB v2 Output ---
-[[outputs.influxdb_v2]]
-  urls = ["{self.influxdb_url}"] # Replace with your InfluxDB URL
-  token = "$DOCKER_INFLUXDB_INIT_ADMIN_TOKEN" # Replace with your InfluxDB Token or env var
-  organization = "$DOCKER_INFLUXDB_INIT_ORG" # Replace with your InfluxDB Org or env var
-  bucket = "OPC UA"
-""")
+        opcua.add("nodes", nodes_aot)
+        opcua_aot.append(opcua)
+        inputs.add("opcua", opcua_aot)
+        doc.add("inputs", inputs)
+        doc.add(nl())
         
-        # Add MQTT output plugins for each node
-        config.append("""
-# --- MQTT Outputs: One per Node (Filtering on 'id' tag) ---
-""")
+        # Add outputs section
+        doc.add(comment("###############################################################################"))
+        doc.add(comment("#                            OUTPUT PLUGINS                                   #"))
+        doc.add(comment("###############################################################################"))
+        doc.add(nl())
         
+        outputs = table()
+        
+        # InfluxDB output
+        doc.add(comment("# --- InfluxDB v2 Output ---"))
+        influxdb_v2_aot = aot()
+        influxdb_v2 = table()
+        influxdb_v2.add("urls", [self.influxdb_url]).comment("Replace with your InfluxDB URL")
+        influxdb_v2.add("token", "$DOCKER_INFLUXDB_INIT_ADMIN_TOKEN").comment("Replace with your InfluxDB Token or env var")
+        influxdb_v2.add("organization", "$DOCKER_INFLUXDB_INIT_ORG").comment("Replace with your InfluxDB Org or env var")
+        influxdb_v2.add("bucket", "OPC UA")
+        influxdb_v2_aot.append(influxdb_v2)
+        outputs.add("influxdb_v2", influxdb_v2_aot)
+        doc.add(nl())
+        
+        # MQTT outputs
+        doc.add(comment("# --- MQTT Outputs: One per Node (Filtering on 'id' tag) ---"))
+        doc.add(nl())
+        
+        mqtt_aot = aot()
         for node in nodes:
-            config.append(f'''# MQTT Output for Node: {node['identifier']}
-[[outputs.mqtt]]
-  servers = ["{self.mqtt_broker}"]
-  topic = "{node['mqtt_topic']}"
-  tagpass = {{ id = ["ns={node['namespace']};s={node['identifier']}"] }}
-  qos = 0
-  retain = false
-  data_format = "template"
-  template = "{{{{ .Field \\"{node['mqtt_custom_name']}\\" }}}}"
-''')
+            doc.add(comment(f"# MQTT Output for Node: {node['identifier']}"))
+            mqtt = table()
+            mqtt.add("servers", [self.mqtt_broker])
+            mqtt.add("topic", node["mqtt_topic"])
+            mqtt.add("tagpass", {"id": [f"ns={node['namespace']};s={node['identifier']}"]})
+            mqtt.add("qos", integer(0))
+            mqtt.add("retain", boolean(False))
+            mqtt.add("data_format", "template")
+            mqtt.add("template", f'{{{{ .Field \\"{node["mqtt_custom_name"]}\\" }}}}')
+            mqtt_aot.append(mqtt)
+        
+        outputs.add("mqtt", mqtt_aot)
+        doc.add("outputs", outputs)
         
         # Write configuration to file
         try:
             logger.info(f"Writing Telegraf configuration to {self.output_file_path}")
             with open(self.output_file_path, 'w', encoding='utf-8') as f:
-                f.write(''.join(config))
+                f.write(doc.as_string())
             logger.info(f"Configuration successfully written to {self.output_file_path}")
         except Exception as e:
             logger.error(f"Error writing configuration file: {e}", exc_info=True)
@@ -279,4 +284,3 @@ class TelegrafConfigGenerator:
             logger.info(f"MQTT topics sanitized: {self._topics_sanitized}")
             logger.info(f"Configuration file: {self.output_file_path}")
             logger.info("-------------------------")
-

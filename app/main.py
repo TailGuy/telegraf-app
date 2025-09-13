@@ -35,6 +35,16 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+MQTT_TOPIC_EXCLUSION_CHARS = [
+    "+",    # Single-level wildcard character - illegal in topic names
+    "#",    # Multi-level wildcard character - illegal in topic names
+    "*",    # SMF wildcard character - causes interoperability issues
+    ">",    # SMF wildcard character - causes interoperability issues
+    "$",    # When used at start of topic - reserved for server implementation
+    "!",    # When used at start of topic - causes interoperability issues in SMF (topic exclusions)
+    # " "     # Space character - avoid as best practice to prevent parsing issues
+]
+
 # --- Application and Client Initialization ---
 app = FastAPI(
     title="Telegraf Manager API",

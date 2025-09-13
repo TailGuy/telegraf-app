@@ -7,3 +7,4 @@ asyncua
 pydantic
 pydantic-settings
 aiofiles
+tomlkit==0.13.3
