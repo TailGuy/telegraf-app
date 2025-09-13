@@ -711,7 +711,7 @@ async def start_telegraf(
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
     return {"success": True, "message": "Telegraf container started."}
 
-# TODO fix this later
+
 @app.post("/telegraf/upload-csv", tags=["Telegraf"])
 async def upload_csv_for_config(
     request: Request,
