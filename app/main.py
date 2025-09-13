@@ -1,4 +1,3 @@
-# type: ignore
 import os
 import time
 import datetime
@@ -6,14 +5,14 @@ import docker
 import logging
 import aiofiles
 import re
-from urllib.parse import quote
 import csv
-import tempfile
+from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Depends, status, Request, UploadFile, File, Form
 from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import FileResponse
 from pydantic_settings import BaseSettings
+from telegraf_config_generator import TelegrafConfigGenerator
 
 # --- Configuration & Logging Setup ---
 SHARED_PATH = "/app/shared_config"
@@ -26,18 +25,6 @@ logger = logging.getLogger("telegraf_manager")
 # You can set the level here if you want to override Uvicorn's default
 # logger.setLevel(logging.INFO) 
 
-# --- MQTT Topic Character Exclusion List ---
-
-MQTT_TOPIC_EXCLUSION_CHARS = [
-    "+",    # Single-level wildcard character - illegal in topic names
-    "#",    # Multi-level wildcard character - illegal in topic names
-    "*",    # SMF wildcard character - causes interoperability issues
-    ">",    # SMF wildcard character - causes interoperability issues
-    "$",    # When used at start of topic - reserved for server implementation
-    "!",    # When used at start of topic - causes interoperability issues in SMF (topic exclusions)
-    # " "     # Space character - avoid as best practice to prevent parsing issues
-]
-
 # --- Base settings for configuration ---
 
 class Settings(BaseSettings):
@@ -49,7 +36,6 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # --- Application and Client Initialization ---
-
 app = FastAPI(
     title="Telegraf Manager API",
     description="API for managing a Telegraf container.",
@@ -729,10 +715,6 @@ async def upload_csv_for_config(
         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
 
     try:
-        # # Save uploaded content to a temp file
-        # with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_csv:
-        #     temp_csv.write(content)
-        #     csv_path = temp_csv.name
 
         nodes_csv_backed_up = False
         try:
@@ -763,14 +745,10 @@ async def upload_csv_for_config(
         )
         generator.run()  # Generates and writes the config to SHARED_CONFIG_PATH
 
-        # # Clean up temp file
-        # os.unlink(csv_path)
         
 
     except Exception as e:
         logger.error(f"Config generation: {e}", exc_info=True)
-        if os.path.exists(csv_path):
-            os.unlink(csv_path)
         safe_error = quote(str(e))
         return RedirectResponse(url=f"/?error={safe_error}", status_code=303)
 
